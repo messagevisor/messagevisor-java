@@ -88,15 +88,21 @@ subprojects {
             }
 
             val repositoryUrl = providers.environmentVariable("MAVEN_REPOSITORY_URL")
-            if (repositoryUrl.isPresent) {
+                .orNull
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+            if (repositoryUrl != null) {
                 repositories {
                     maven {
                         name = "release"
-                        url = uri(repositoryUrl.get())
+                        url = uri(repositoryUrl)
                         val repositoryUsername = providers.environmentVariable("MAVEN_REPOSITORY_USERNAME")
-                        if (repositoryUsername.isPresent) {
+                            .orNull
+                            ?.trim()
+                            ?.takeIf { it.isNotEmpty() }
+                        if (repositoryUsername != null) {
                             credentials {
-                                username = repositoryUsername.get()
+                                username = repositoryUsername
                                 password = providers.environmentVariable("MAVEN_REPOSITORY_PASSWORD").orNull
                             }
                         }
@@ -107,15 +113,17 @@ subprojects {
 
         configure<SigningExtension> {
             val signingKey = providers.environmentVariable("SIGNING_KEY")
-            val signingPassword = providers.environmentVariable("SIGNING_PASSWORD")
-            if (signingKey.isPresent) {
-                useInMemoryPgpKeys(signingKey.get(), signingPassword.orNull)
+                .orNull
+                ?.takeIf { it.isNotBlank() }
+            val signingPassword = providers.environmentVariable("SIGNING_PASSWORD").orNull
+            if (signingKey != null) {
+                useInMemoryPgpKeys(signingKey, signingPassword)
                 sign(project.extensions.getByType<PublishingExtension>().publications["mavenJava"])
             }
         }
 
         tasks.withType<Sign>().configureEach {
-            onlyIf { providers.environmentVariable("SIGNING_KEY").isPresent }
+            onlyIf { !providers.environmentVariable("SIGNING_KEY").orNull.isNullOrBlank() }
         }
     }
 }

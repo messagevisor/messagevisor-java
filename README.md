@@ -81,13 +81,29 @@ The repository also includes Java modules and a conformance CLI for checking the
 Published artifacts use the `com.messagevisor` group:
 
 ```kotlin
+repositories {
+    maven {
+        url = uri("https://maven.pkg.github.com/messagevisor/messagevisor-java")
+        credentials {
+            username = providers.gradleProperty("gpr.user").orNull
+                ?: System.getenv("GITHUB_ACTOR")
+            password = providers.gradleProperty("gpr.key").orNull
+                ?: System.getenv("GITHUB_TOKEN")
+        }
+    }
+}
+```
+
+GitHub Packages requires authentication, including for public packages. Use a GitHub personal access token with `read:packages` through the `gpr.user` and `gpr.key` Gradle properties, or the corresponding environment variables.
+
+```kotlin
 dependencies {
     implementation("com.messagevisor:messagevisor-sdk:0.1.0")
     implementation("com.messagevisor:messagevisor-module-icu:0.1.0")
 }
 ```
 
-Repository builds use the version in `gradle.properties`; `-Pversion=<version>` overrides it for a release. Maintainers can publish signed artifacts to a Maven-compatible repository by setting `MAVEN_REPOSITORY_URL`, repository credentials, and the in-memory `SIGNING_KEY`/`SIGNING_PASSWORD`, then running `./gradlew publish`. Use `publishToMavenLocal` for a local release smoke test. Publishing a GitHub release runs the same build and derives every artifact and CLI version from the release tag.
+Repository builds use the version in `gradle.properties`; `-Pversion=<version>` overrides it for a release. Maintainers can publish signed artifacts to a Maven-compatible repository by setting `MAVEN_REPOSITORY_URL`, repository credentials, and the in-memory `SIGNING_KEY` and `SIGNING_PASSWORD`, then running `./gradlew publish`. Use `publishToMavenLocal` for a local release smoke test. Publishing a GitHub release derives every artifact and CLI version from the release tag and publishes to GitHub Packages using the workflow's `GITHUB_TOKEN`.
 
 ## Initialization
 
