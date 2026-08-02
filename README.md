@@ -98,8 +98,8 @@ GitHub Packages requires authentication, including for public packages. Use a Gi
 
 ```kotlin
 dependencies {
-    implementation("com.messagevisor:messagevisor-sdk:0.1.0")
-    implementation("com.messagevisor:messagevisor-module-icu:0.1.0")
+    implementation("com.messagevisor:messagevisor-sdk:0.2.0")
+    implementation("com.messagevisor:messagevisor-module-icu:0.2.0")
 }
 ```
 
@@ -1079,7 +1079,7 @@ make verify-artifacts
 
 1. Update `gradle.properties`, the installation versions in this README, and `CHANGELOG.md` to the same release version.
 2. Merge the release commit into `main`.
-3. Create and publish a GitHub release using a semantic version tag with a `v` prefix, such as `v0.1.0`.
+3. Create and publish a GitHub release using a semantic version tag with a `v` prefix, such as `v0.2.0`.
 4. GitHub Actions validates the tag, builds and tests every artifact, checks the publication boundaries, and publishes the signed artifacts to the configured Maven repository.
 5. Verify the published POMs, JARs, source JARs, Javadoc JARs, signatures, and checksums from a clean consumer project.
 
