@@ -18,5 +18,6 @@ dependencies {
     implementation(libs.picocli)
     implementation(libs.jackson.databind)
     testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.platform.launcher)
     testImplementation(libs.assertj.core)
 }

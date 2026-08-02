@@ -2,6 +2,7 @@
 jackson = "2.19.2"
 icu4j = "78.3"
 junit = "5.10.3"
+junitPlatform = "1.10.3"
 picocli = "4.7.7"
 assertj = "3.27.3"
 
@@ -10,4 +11,5 @@ jackson-databind = { module = "com.fasterxml.jackson.core:jackson-databind", ver
 icu4j = { module = "com.ibm.icu:icu4j", version.ref = "icu4j" }
 picocli = { module = "info.picocli:picocli", version.ref = "picocli" }
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher", version.ref = "junitPlatform" }
 assertj-core = { module = "org.assertj:assertj-core", version.ref = "assertj" }
