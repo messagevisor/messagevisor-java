@@ -1,0 +1,77 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Validate release version
+        id: version
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "Expected a semantic version tag with a v prefix" >&2
+            exit 1
+          fi
+
+          version="${GITHUB_REF_NAME#v}"
+          configured_version="$(sed -n 's/^version=//p' gradle.properties)"
+
+          if [[ "$configured_version" != "$version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match gradle.properties ($configured_version)" >&2
+            exit 1
+          fi
+
+          if ! grep -Fq "messagevisor-sdk:$version" README.md; then
+            echo "README installation version does not match $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+          if ! grep -Fq "## $version" CHANGELOG.md; then
+            echo "CHANGELOG does not contain a $version release" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Publishing Messagevisor Java $version"
+
+      - name: Build and test release artifacts
+        run: >-
+          ./gradlew clean build generatePomFileForMavenJavaPublication
+          -Pversion=${{ steps.version.outputs.version }}
+
+      - name: Verify published artifact boundaries
+        run: bash scripts/verify-artifacts.sh
+
+      - name: Publish signed release artifacts
+        env:
+          MAVEN_REPOSITORY_URL: ${{ secrets.MAVEN_REPOSITORY_URL }}
+          MAVEN_REPOSITORY_USERNAME: ${{ secrets.MAVEN_REPOSITORY_USERNAME }}
+          MAVEN_REPOSITORY_PASSWORD: ${{ secrets.MAVEN_REPOSITORY_PASSWORD }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: ./gradlew publish -Pversion=${{ steps.version.outputs.version }}
