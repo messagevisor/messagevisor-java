@@ -98,8 +98,8 @@ GitHub Packages requires authentication, including for public packages. Use a Gi
 
 ```kotlin
 dependencies {
-    implementation("com.messagevisor:messagevisor-sdk:0.2.0")
-    implementation("com.messagevisor:messagevisor-module-icu:0.2.0")
+    implementation("com.messagevisor:messagevisor-sdk:0.3.0")
+    implementation("com.messagevisor:messagevisor-module-icu:0.3.0")
 }
 ```
 
@@ -167,6 +167,8 @@ Messagevisor m = Messagevisor.create(
 ```
 
 There is also a simpler interpolation module that can be used to interpolate primitive values into messages without the full ICU MessageFormat syntax.
+
+The ICU module evaluates only the selected `select`, `plural`, or `selectordinal` branch. Values used exclusively by other branches are not required, and their formatters do not run. A missing argument in the selected branch reports `invalid_message` and throws. Apostrophe quoted ICU syntax stays literal, and inserted values are never parsed again as message syntax.
 
 ## Translations
 
@@ -298,7 +300,7 @@ Messagevisor m = Messagevisor.create(
 );
 ```
 
-The generated datafile already contains locale info, so you do not need to pass it manually.
+The generated datafile already contains locale info, so you do not need to pass it manually. An initial datafile establishes the active locale even when a different constructor `locale` is supplied.
 
 ### Setting datafile afterwards
 
@@ -314,7 +316,13 @@ When no locale is active yet, the first successful `setDatafile` call also sets 
 
 You can keep calling `setDatafile` to update the datafile for a given locale.
 
-If the SDK already has a datafile for the incoming locale, `setDatafile` merges the incoming datafile with the existing one by default. Segments, messages, and translations are merged by key, while top-level fields such as `revision`, `target`, and `formats` come from the incoming datafile.
+If the SDK already has a datafile for the incoming locale, `setDatafile` merges the incoming datafile with the existing one by default. Segments, messages, and translations are merged by key, while fields such as `revision` and `target` come from the incoming datafile. Formats merge by family and preset name. Omitted families and presets remain available, and an incoming preset with the same name replaces the whole stored preset. Evaluation still combines default formats, stored formats, and call formats field by field.
+
+Typed `DatafileContent` inputs are copied on entry, just like parsed JSON. Loading, merging, or replacing a datafile does not mutate the supplied object or another independent instance that received it. To update stored state, call `setDatafile` again rather than editing the original input.
+
+Malformed JSON or an invalid datafile shape reports `invalid_datafile` with the message `could not parse datafile`. The call does not throw or change stored state. A datafile requires `schemaVersion: "1"`, string identity fields, a nonempty `locale`, and object maps for `segments`, `messages`, and `translations`. Optional `formats` must be an object and optional `direction` must be `ltr` or `rtl`. Java also validates values when converting JSON into its typed datafile models.
+
+Dictionary keys such as `constructor`, `toString`, and `__proto__` are ordinary keys. They resolve only when present, including in translations, defaults, named presets, segments, and context maps.
 
 ### Replacing datafile
 
@@ -348,7 +356,7 @@ Once you have the desired datafiles set, switch between loaded locales at runtim
 m.setLocale("nl-NL");
 ```
 
-The SDK switches the active locale to one that already has a datafile loaded. `setLocale` throws if that locale has no datafile yet.
+The SDK switches the active locale to one that already has a datafile loaded. `setLocale` reports `missing_datafile` and throws if that locale has no datafile yet, leaving the active locale unchanged.
 
 **NOTE**: `setDatafile` for a new locale does not change the active locale automatically. The first datafile loaded becomes active, and later `setDatafile` calls for other locales only register those datafiles until you call `setLocale`.
 
@@ -503,7 +511,7 @@ m.formatDate(
 );
 ```
 
-Time zone resolution follows the same rules as [Time zone](#time-zone): per-call `timeZone`, then the preset's `timeZone`, then the instance time zone.
+Time zone resolution follows the same rules as [Time zone](#time-zone): the call's `timeZone`, then the preset's `timeZone`, then the instance time zone, then the host default captured when the root instance was created. Children share that captured host default. This also applies to ICU date and time arguments, including bare arguments, styles, skeletons, and nested branches. A bare direct `formatTime` call formats hours, minutes, and seconds. Unknown time zone identifiers are rejected rather than silently becoming GMT.
 
 Use `formatDateToParts` for segmented output:
 
@@ -584,7 +592,7 @@ m.formatList(
 );
 ```
 
-Options are mapped to ICU4J list formatting behavior. Use `formatListToParts` for simplified element parts.
+Options are mapped to ICU4J list formatting behaviour. `formatListToParts` returns native element and literal records, preserving conjunctions and separators. Joining the part values reproduces `formatList`; an empty list returns no parts.
 
 ### Display name formatting
 
@@ -610,7 +618,12 @@ m.formatPlural(1);
 
 m.formatPlural(2, true);
 // ordinal category
+
+m.formatPlural(1, Map.of("minimumFractionDigits", 2));
+// → "other" in English, because the visible number is 1.00
 ```
+
+The options map accepts plural `type` (`cardinal` or `ordinal`), fraction and significant digit precision, and rounding options. These affect the plural operands, not just display. You can include `locale` in the map or pass a separate `EvaluationOptions`. Children expose the same overloads.
 
 You can also pass `EvaluationOptions` when the plural category should use a different locale:
 
@@ -822,9 +835,9 @@ Common built-in codes include:
 - `missing_translation`: key missing from datafile and `defaultTranslations`
 - `missing_datafile` / `missing_locale`: locale or datafile not available
 - `missing_format`: a requested named format preset is absent
-- `invalid_format`: formatter options are invalid for the runtime
+- `invalid_format`: formatter options or date values are invalid for the runtime, including unknown time zones; the exception is rethrown
 - `invalid_datafile`: JSON parse or shape failure
-- `invalid_message`: module formatting threw
+- `invalid_message`: a module format or transform hook threw; details include the hook and effective locale, and the original exception is rethrown
 - `deprecated_message`: message has deprecated metadata
 - `message_override_matched`: debug-level override match
 - `unsupported_formatter`: runtime-native formatter limitation or unsupported option
@@ -900,6 +913,12 @@ m.removeModule("icu");
 ```
 
 Resolver changes installed during module setup belong to that module. Setup failure or removal restores the previous resolver, and spawned instances observe later parent resolver changes dynamically.
+
+Removal also clears that module's diagnostic subscriptions and resolver registrations in existing children. Retained module APIs cannot register new subscriptions or resolvers after removal. Closing a child clears its own registrations without closing shared modules.
+
+Constructor modules run setup after initial locale, defaults, and datafile state are ready, and before `sdk_initialized` is reported. Setup failure reports `module_setup_error`, cleans up partial registration, and does not throw from construction.
+
+Java completes the failed module's synchronous cleanup before delivering `module_setup_error`, so a diagnostic observer may safely close the SDK. The original setup failure remains the diagnostic's cause even if partial cleanup also fails.
 
 ### Registering at project level
 
@@ -980,6 +999,8 @@ m.close();
 m.closeAsync().join();
 ```
 
+Concurrent and repeated `closeAsync()` calls share the same completion future, including any aggregate cleanup failure. A concurrent `close()` waits for that cleanup too. Modules are closed once, in reverse registration order.
+
 ## Translation lookup
 
 `translate` and `getRawTranslation` resolve a source string first, then run registered modules on that string. Understanding lookup helps when debugging overrides, fallbacks, and missing-translation diagnostics.
@@ -1031,6 +1052,8 @@ After the source string is resolved, `translate` runs modules in registration or
 
 The Java CLI reuses the JavaScript Messagevisor CLI for source-project truth. It shells out to `npx messagevisor` for built datafiles, tests, segments, and examples, then evaluates them with the Java SDK.
 
+The examples command compares every Java result with `expectedByRuntime.java` when present, otherwise with the JavaScript `evaluatedTranslation`. Mismatches make the command fail. Use `--onlyFailures` for compact output and `--normalizeSpaces` to treat only ordinary spaces, no break spaces, and narrow no break spaces as equivalent. Both reference project Make targets use only the ICU module, matching the project configuration.
+
 The SDK test suite also executes the canonical language-neutral `conformance/sdk-v1.json` contract. That contract covers conditions and segments, combined override matching, empty and fallback translations, deprecation diagnostics, locale-keyed datafile merge/replacement, module lifecycle, diagnostic envelopes, and event ordering with change sources. The bundled fixture is checked against the monorepo copy when both repositories are available.
 
 ```sh
@@ -1079,7 +1102,7 @@ make verify-artifacts
 
 1. Update `gradle.properties`, the installation versions in this README, and `CHANGELOG.md` to the same release version.
 2. Merge the release commit into `main`.
-3. Create and publish a GitHub release using a semantic version tag with a `v` prefix, such as `v0.2.0`.
+3. Create and publish a GitHub release using a semantic version tag with a `v` prefix, such as `v0.3.0`.
 4. GitHub Actions validates the tag, builds and tests every artifact, checks the publication boundaries, and publishes the signed artifacts to the configured Maven repository.
 5. Verify the published POMs, JARs, source JARs, Javadoc JARs, signatures, and checksums from a clean consumer project.
 
@@ -1101,7 +1124,7 @@ Where Messagevisor project fixtures need cross-runtime expectations, prefer `exp
 
 Do not add Java branches for specific locales, named time zones, unit labels, or compact suffixes. Use ICU4J locale APIs such as number, measure, date/time, relative, list, and display-name formatting, then document unavoidable differences in fixtures.
 
-The ICU module uses ICU4J classic `MessageFormat`. ICU MessageFormat 2 is intentionally not used for this first Java port because it is still treated as a newer technical-preview style API in the ICU ecosystem.
+The ICU module uses ICU4J's classic message parser and native plural rules and formatters. It traverses the parsed message to evaluate only selected branches, while ICU handles apostrophe quoting, number styles, and skeletons. ICU MessageFormat 2 is not used.
 
 ## Related
 

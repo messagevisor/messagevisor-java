@@ -157,6 +157,81 @@ final class IcuModuleTest {
                     && diagnostic.message().contains("roundingPriority"));
   }
 
+  @Test
+  void honorsTimeZonesForBareStyledSkeletonAndNestedDateTimeArguments() {
+    com.messagevisor.sdk.Messagevisor m = Messagevisor.create(MessagevisorOptions.builder()
+        .locale("en-US").timeZone("America/Los_Angeles").addModule(IcuModule.create())
+        .logLevel(LogLevel.FATAL).build());
+    FormatPresets formats = new FormatPresets();
+    formats.setTime(Map.of("clock", Map.of("hour", "2-digit", "minute", "2-digit", "hour12", false, "timeZone", "UTC")));
+    String instant = "2026-05-12T00:30:45Z";
+    Map<String, Object> values = Map.of("when", instant, "choice", "yes", "__messagevisor_icu_0", "user value");
+    var tokyo = com.messagevisor.sdk.EvaluationOptions.builder().timeZone("Asia/Tokyo").formats(formats).build();
+    var presets = com.messagevisor.sdk.EvaluationOptions.builder().formats(formats).build();
+    assertThat(m.formatMessage("{when, time}", values)).contains("5:30:45");
+    assertThat(m.formatMessage("{when, time, short}", values)).contains("5:30");
+    assertThat(m.formatMessage("{when, date}", values)).contains("11");
+    assertThat(m.formatMessage("{when, time, ::HHmm}", values)).isEqualTo("17:30");
+    assertThat(m.formatMessage("{when, date, ::yyyyMMdd}", values)).contains("11");
+    assertThat(m.formatMessage("{when, time, ::HHmm}", values, tokyo)).isEqualTo("09:30");
+    assertThat(m.formatMessage("{when, time, clock}", values, presets)).isEqualTo("00:30");
+    assertThat(m.formatMessage("{when, time, clock}", values, tokyo)).isEqualTo("09:30");
+    assertThat(m.formatMessage("{choice, select, yes {{when, time, ::HHmm}} other {no}}", values, tokyo)).isEqualTo("09:30");
+    assertThat(m.formatMessage("{when, time, ::HHmm} {__messagevisor_icu_0}", values)).isEqualTo("17:30 user value");
+    var child = m.spawn(Map.of(), new com.messagevisor.sdk.MessagevisorSpawnOptions(null, null, "Asia/Tokyo"));
+    assertThat(child.formatMessage("{when, time, ::HHmm}", values)).isEqualTo("09:30");
+    assertThat(child.formatMessage("{when, time, clock}", values, presets)).isEqualTo("00:30");
+    assertThat(child.formatMessage("{when, time, ::HHmm}", values,
+        com.messagevisor.sdk.EvaluationOptions.builder().timeZone("UTC").build())).isEqualTo("00:30");
+    assertThat(m.getTimeZone()).isEqualTo("America/Los_Angeles");
+  }
+
+  @Test
+  void executesSharedNamedTimeZoneConformanceForRootAndChild() throws Exception {
+    com.fasterxml.jackson.databind.JsonNode zones;
+    try (var input = IcuModuleTest.class.getResourceAsStream("/conformance/sdk-v1.json")) {
+      zones = com.messagevisor.sdk.JsonSupport.MAPPER.readTree(input).path("hardening").path("timeZones");
+    }
+    String instant = zones.path("instant").asText();
+    FormatPresets formats = new FormatPresets();
+    formats.setTime(Map.of("clock", Map.of("hour", "2-digit", "minute", "2-digit", "second", "2-digit",
+        "hour12", false, "timeZone", zones.path("preset").asText())));
+    formats.setDate(Map.of("day", Map.of("year", "numeric", "month", "2-digit", "day", "2-digit",
+        "timeZone", zones.path("preset").asText())));
+    Messagevisor m = Messagevisor.create(MessagevisorOptions.builder().locale("en-US")
+        .timeZone(zones.path("instance").asText()).defaultFormats(Map.of("en-US", formats))
+        .addModule(IcuModule.create()).logLevel(LogLevel.FATAL).build());
+    var child = m.spawn(Map.of(), new com.messagevisor.sdk.MessagevisorSpawnOptions(null, null, zones.path("call").asText()));
+    for (var options : java.util.List.of(com.messagevisor.sdk.EvaluationOptions.builder().build(),
+        com.messagevisor.sdk.EvaluationOptions.builder().timeZone(zones.path("call").asText()).build())) {
+      assertThat(m.formatMessage("{when, time, clock}", Map.of("when", instant), options))
+          .isEqualTo(m.formatTime(instant, "clock", options));
+      assertThat(m.formatMessage("{when, date, day}", Map.of("when", instant), options))
+          .isEqualTo(m.formatDate(instant, "day", options));
+      assertThat(child.formatMessage("{when, time, clock}", Map.of("when", instant), options))
+          .isEqualTo(child.formatTime(instant, "clock", options));
+      assertThat(child.formatMessage("{when, date, day}", Map.of("when", instant), options))
+          .isEqualTo(child.formatDate(instant, "day", options));
+    }
+  }
+
+  @Test
+  void bareIcuArgumentsShareTheCapturedRootHostTimeZone() {
+    com.ibm.icu.util.TimeZone original = com.ibm.icu.util.TimeZone.getDefault();
+    try {
+      com.ibm.icu.util.TimeZone.setDefault(com.ibm.icu.util.TimeZone.getTimeZone("UTC"));
+      Messagevisor m = Messagevisor.create(MessagevisorOptions.builder().locale("en-US")
+          .addModule(IcuModule.create()).logLevel(LogLevel.FATAL).build());
+      com.ibm.icu.util.TimeZone.setDefault(com.ibm.icu.util.TimeZone.getTimeZone("Asia/Tokyo"));
+      var child = m.spawn(Map.of());
+      Map<String, Object> values = Map.of("when", "2026-05-12T00:30:45Z");
+      assertThat(m.formatMessage("{when, time, ::HHmm}", values)).isEqualTo("00:30");
+      assertThat(child.formatMessage("{when, time, ::HHmm}", values)).isEqualTo("00:30");
+    } finally {
+      com.ibm.icu.util.TimeZone.setDefault(original);
+    }
+  }
+
   private static Map<String, Object> map(Object... entries) {
     Map<String, Object> result = new LinkedHashMap<>();
     for (int i = 0; i < entries.length; i += 2) {

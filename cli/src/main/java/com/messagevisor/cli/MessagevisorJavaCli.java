@@ -308,6 +308,12 @@ public final class MessagevisorJavaCli implements Callable<Integer> {
     @Option(names = "--pretty")
     boolean pretty;
 
+    @Option(names = "--normalizeSpaces", description = "Normalize only ordinary, no-break and narrow no-break spaces")
+    boolean normalizeSpaces;
+
+    @Option(names = "--onlyFailures")
+    boolean onlyFailures;
+
     @Override
     public Integer call() throws Exception {
       List<String> args =
@@ -317,22 +323,38 @@ public final class MessagevisorJavaCli implements Callable<Integer> {
               "--includeEvaluationInput",
               locale == null ? null : "--locale=" + locale);
       Map<String, Object> result = readJson(runMessagevisor(shared.projectDirectoryPath, args), new TypeReference<>() {});
-      reevaluateExamples(listOfMaps(result.get("locales")));
-      reevaluateExamples(listOfMaps(result.get("messages")));
+      List<String> failures = new ArrayList<>();
+      List<Map<String, Object>> examples = new ArrayList<>(listOfMaps(result.get("locales")));
+      examples.addAll(listOfMaps(result.get("messages")));
+      for (Map<String, Object> example : examples) {
+        failures.addAll(verifyExample(example, shared.modules(), normalizeSpaces));
+      }
       removeEvaluationInputs(result);
+      result.put("failures", failures);
       if (json) {
         printJson(result, pretty);
       } else {
-        printExamplesPlain(result);
+        if (!onlyFailures) printExamplesPlain(result);
+        failures.forEach(System.out::println);
+        System.out.println("Examples: " + examples.size() + " evaluated, " + failures.size() + " failed");
       }
-      return 0;
+      return failures.isEmpty() ? 0 : 1;
     }
+  }
 
-    private void reevaluateExamples(List<Map<String, Object>> examples) {
-      for (Map<String, Object> example : examples) {
-        reevaluateExample(example, shared.modules());
-      }
-    }
+  static List<String> verifyExample(Map<String, Object> example, List<MessagevisorModule> modules, boolean normalizeSpaces) {
+    Map<String, Object> expected = new LinkedHashMap<>(example);
+    expected.put("expectedTranslation", example.get("evaluatedTranslation"));
+    reevaluateExample(example, modules);
+    List<String> failures = new ArrayList<>();
+    compareTranslation(expected, stringValue(example.get("target")), stringValue(example.get("locale")),
+        stringValue(example.get("evaluatedTranslation")), normalizeSpaces, failures);
+    Map<String, Object> identity = new LinkedHashMap<>(expected);
+    identity.remove("evaluationInput");
+    identity.remove("expectedTranslation");
+    identity.remove("evaluatedTranslation");
+    identity.remove("expectedByRuntime");
+    return failures.stream().map(failure -> "Example: " + identity + "\n" + failure).toList();
   }
 
   static void reevaluateExample(Map<String, Object> example, List<MessagevisorModule> modules) {

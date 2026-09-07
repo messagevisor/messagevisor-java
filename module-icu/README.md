@@ -14,8 +14,8 @@ Published releases use the `com.messagevisor` group:
 
 ```kotlin
 dependencies {
-    implementation("com.messagevisor:messagevisor-sdk:0.2.0")
-    implementation("com.messagevisor:messagevisor-module-icu:0.2.0")
+    implementation("com.messagevisor:messagevisor-sdk:0.3.0")
+    implementation("com.messagevisor:messagevisor-module-icu:0.3.0")
 }
 ```
 

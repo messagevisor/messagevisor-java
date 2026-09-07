@@ -13,3 +13,7 @@ dependencies {
     testRuntimeOnly(libs.junit.platform.launcher)
     testImplementation(libs.assertj.core)
 }
+
+sourceSets.test {
+    resources.srcDir("../sdk/src/test/resources")
+}
