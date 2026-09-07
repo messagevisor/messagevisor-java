@@ -78,4 +78,10 @@ jobs:
         run: >-
           ./gradlew :cli:run
           --args='test --projectDirectoryPath=project-1 --onlyFailures --target=java
-          --normalizeSpaces --withIcuModule --withInterpolationModule'
+          --normalizeSpaces --withIcuModule'
+
+      - name: Verify formatter examples against Java SDK
+        run: >-
+          ./gradlew :cli:run
+          --args='examples --projectDirectoryPath=project-1 --onlyFailures
+          --normalizeSpaces --withIcuModule'

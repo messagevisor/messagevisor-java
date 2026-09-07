@@ -83,6 +83,23 @@ final class MessagevisorJavaCliTest {
     assertThat(rawExample.get("evaluatedTranslation")).isEqualTo("1.2");
   }
 
+  @Test
+  void examplesCompareEveryNativeResultAndPreferExplicitRuntimeExpectations() {
+    Map<String, Object> example = map("locale", "en-US", "description", "literal",
+        "rawMessage", "native", "evaluatedTranslation", "JavaScript", "evaluationInput", map());
+    assertThat(MessagevisorJavaCli.verifyExample(example, List.of(), true)).singleElement()
+        .asString().contains("description=literal", "expected: JavaScript", "actual: native");
+    example.put("evaluatedTranslation", "JavaScript");
+    example.put("expectedByRuntime", Map.of("java", "native"));
+    assertThat(MessagevisorJavaCli.verifyExample(example, List.of(), true)).isEmpty();
+    example.put("rawMessage", "A\u00a0B\u202fC");
+    example.put("expectedByRuntime", Map.of("java", "A B C"));
+    assertThat(MessagevisorJavaCli.verifyExample(example, List.of(), true)).isEmpty();
+    assertThat(MessagevisorJavaCli.verifyExample(example, List.of(), false)).hasSize(1);
+    example.put("rawMessage", "A\u200e B C");
+    assertThat(MessagevisorJavaCli.verifyExample(example, List.of(), true)).hasSize(1);
+  }
+
   private static Map<String, Object> map(Object... entries) {
     Map<String, Object> result = new LinkedHashMap<>();
     for (int i = 0; i < entries.length; i += 2) {

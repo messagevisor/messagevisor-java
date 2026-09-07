@@ -22,6 +22,8 @@ public final class Messagevisor implements AutoCloseable {
   private final List<MessagevisorModule> modules = new CopyOnWriteArrayList<>();
   private final List<ModuleDiagnosticSubscription> moduleDiagnosticSubscriptions = new CopyOnWriteArrayList<>();
   private final Map<String, MessagevisorModuleApi> moduleApis = new ConcurrentHashMap<>();
+  private final Map<String, AtomicBoolean> moduleApiActivity = new ConcurrentHashMap<>();
+  private final List<Messagevisor> children = new CopyOnWriteArrayList<>();
   private final Map<MessagevisorModule, String> anonymousModuleApiKeys =
       Collections.synchronizedMap(new java.util.IdentityHashMap<>());
   private final List<ModuleFlagResolver> moduleFlagResolvers = new CopyOnWriteArrayList<>();
@@ -30,11 +32,15 @@ public final class Messagevisor implements AutoCloseable {
   private final Object moduleLock = new Object();
   private final Object contextLock = new Object();
   private final Object parentEventLock = new Object();
+  private final Object closeLock = new Object();
+  private CompletableFuture<Void> closeCompletion;
+  private volatile Thread closingThread;
   private final Messagevisor parent;
   private volatile Map<String, Object> context;
   private volatile String locale;
   private volatile String currency;
   private volatile String timeZone;
+  private final String defaultTimeZone;
   private volatile FlagResolver resolveFlag;
   private volatile VariationResolver resolveVariation;
   private volatile boolean hasOwnFlagResolver;
@@ -62,9 +68,11 @@ public final class Messagevisor implements AutoCloseable {
     this.defaultTranslationsByLocale = parent == null ? options.defaultTranslations() : parent.defaultTranslationsByLocale;
     this.defaultFormatsByLocale = parent == null ? options.defaultFormats() : parent.defaultFormatsByLocale;
     this.context = options.context();
-    this.locale = options.locale();
+    this.locale = options.datafile() == null ? options.locale() : null;
     this.currency = options.currency();
     this.timeZone = options.timeZone();
+    this.defaultTimeZone = parent == null
+        ? com.ibm.icu.util.TimeZone.getDefault().getID() : parent.defaultTimeZone;
     this.resolveFlag = options.resolveFlag();
     this.resolveVariation = options.resolveVariation();
     this.hasOwnFlagResolver = parent == null && options.resolveFlag() != null;
@@ -74,13 +82,14 @@ public final class Messagevisor implements AutoCloseable {
     for (EventName eventName : EventName.values()) {
       listeners.put(eventName, new CopyOnWriteArrayList<>());
     }
-    if (parent == null) for (MessagevisorModule module : options.modules()) addModule(module);
     if (options.datafile() != null) {
       setDatafile(options.datafile());
     }
+    if (parent == null) for (MessagevisorModule module : options.modules()) addModule(module);
     if (parent != null) {
       captureObservedParentDatafileState();
       trackParentSubscription(parent.on(EventName.DATAFILE_SET, this::forwardParentDatafileEvent));
+      parent.children.add(this);
     }
     if (parent == null) reportDiagnostic(
         MessagevisorDiagnostic.builder(LogLevel.INFO, "sdk_initialized", "SDK initialized").build());
@@ -203,7 +212,9 @@ public final class Messagevisor implements AutoCloseable {
     if (closed.get()) {
       return () -> {};
     }
+    MessagevisorDiagnostic setupFailure = null;
     synchronized (moduleLock) {
+      if (closed.get()) return () -> {};
       String name = module.name();
       if (name != null
           && modules.stream().anyMatch(current -> Objects.equals(current.name(), name))) {
@@ -221,25 +232,28 @@ public final class Messagevisor implements AutoCloseable {
         module.setup(getModuleApi(module));
       } catch (RuntimeException error) {
         clearModuleDiagnosticSubscriptions(module);
-        reportDiagnostic(
-            MessagevisorDiagnostic.builder(
-                    LogLevel.ERROR, "module_setup_error", "Module setup failed")
-                .moduleName(module.name())
-                .originalError(error)
-                .build());
+        // Complete synchronous partial cleanup before notifying observers, which
+        // may close the SDK and rely on all earlier cleanup having finished.
         try {
           module.close();
         } catch (Exception ignored) {
           // Setup already failed; the setup diagnostic remains the primary failure.
         }
-        return () -> {};
+        setupFailure = MessagevisorDiagnostic.builder(
+                LogLevel.ERROR, "module_setup_error", "Module setup failed")
+            .moduleName(module.name()).originalError(error).build();
       }
-      modules.add(module);
-      AtomicBoolean removed = new AtomicBoolean(false);
-      return () -> {
-        if (removed.compareAndSet(false, true)) removeModuleInstance(module);
-      };
+      if (setupFailure == null) {
+        modules.add(module);
+        AtomicBoolean removed = new AtomicBoolean(false);
+        return () -> {
+          if (removed.compareAndSet(false, true)) removeModuleInstance(module);
+        };
+      }
     }
+    // Do not hold the registration lock while an observer waits for closeAsync().
+    reportDiagnostic(setupFailure);
+    return () -> {};
   }
 
   public void removeModule(String name) {
@@ -258,8 +272,10 @@ public final class Messagevisor implements AutoCloseable {
   }
 
   private void removeModuleInstance(MessagevisorModule module) {
-    if (!modules.remove(module)) return;
-    clearModuleDiagnosticSubscriptions(module);
+    synchronized (moduleLock) {
+      if (!modules.remove(module)) return;
+      clearModuleDiagnosticSubscriptions(module);
+    }
     try {
       module.close();
     } catch (Exception error) {
@@ -321,9 +337,6 @@ public final class Messagevisor implements AutoCloseable {
     DatafileContent incoming;
     try {
       incoming = JsonSupport.parseDatafile(datafile);
-      if (incoming.getLocale() == null || incoming.getLocale().isBlank()) {
-        throw new IllegalArgumentException("Datafile must include locale.");
-      }
     } catch (RuntimeException error) {
       reportDiagnostic(
           MessagevisorDiagnostic.builder(LogLevel.ERROR, "invalid_datafile", "could not parse datafile")
@@ -381,7 +394,9 @@ public final class Messagevisor implements AutoCloseable {
   }
 
   public void setLocale(String locale) {
-    if (!datafiles.containsKey(locale)) {
+    if (locale == null || !datafiles.containsKey(locale)) {
+      reportDiagnostic(MessagevisorDiagnostic.builder(LogLevel.ERROR, "missing_datafile", "Datafile not found for locale")
+          .detail("locale", locale).build());
       throw new MessagevisorException("Datafile not found for locale: " + locale);
     }
     MessagevisorSnapshot previousSnapshot = getSnapshot();
@@ -484,7 +499,7 @@ public final class Messagevisor implements AutoCloseable {
                 formats,
                 options.moduleOptions(),
                 options.currency(),
-                options.timeZone()));
+                firstDefined(options.timeZone(), timeZone, defaultTimeZone)));
     Object transformed =
         runTransforms(
             formatted,
@@ -514,7 +529,7 @@ public final class Messagevisor implements AutoCloseable {
                 formats,
                 options.moduleOptions(),
                 options.currency(),
-                options.timeZone()));
+                firstDefined(options.timeZone(), timeZone, defaultTimeZone)));
     Object transformed =
         runTransforms(
             formatted,
@@ -714,10 +729,19 @@ public final class Messagevisor implements AutoCloseable {
   }
 
   public String formatPlural(double value, boolean ordinal, EvaluationOptions options) {
+    return formatPlural(value, Map.of("type", ordinal ? "ordinal" : "cardinal"), options);
+  }
+
+  public String formatPlural(double value, Map<String, Object> options) {
+    String currentLocale = getOptionLocale(options);
+    return formatPlural(value, withoutLocaleOption(options), EvaluationOptions.builder().locale(currentLocale).build());
+  }
+
+  public String formatPlural(double value, Map<String, Object> format, EvaluationOptions options) {
     String currentLocale = getCurrentLocale(options);
-    Map<String, Object> resolved = Map.of("ordinal", ordinal);
+    Map<String, Object> resolved = CloneUtils.deepCopyMap(format);
     return formatSafely("plural", currentLocale, resolved,
-        () -> MessagevisorFormatters.formatPlural(value, currentLocale, ordinal));
+        () -> MessagevisorFormatters.formatPlural(value, currentLocale, resolved));
   }
 
   public String formatList(List<String> values) {
@@ -738,7 +762,6 @@ public final class Messagevisor implements AutoCloseable {
 
   public List<FormatPart> formatListToParts(List<String> values, Map<String, Object> options) {
     reportFormatterDiagnostics("list", options, "formatListToParts", null);
-    reportFormatterDiagnostics("parts", options, "formatListToParts", null);
     String currentLocale = getOptionLocale(options);
     Map<String, Object> resolved = withoutLocaleOption(options);
     return formatSafely("list", currentLocale, resolved,
@@ -755,18 +778,73 @@ public final class Messagevisor implements AutoCloseable {
 
   @Override
   public void close() {
-    if (!closed.compareAndSet(false, true)) {
-      return;
+    CompletableFuture<Void> completion;
+    boolean start;
+    synchronized (closeLock) {
+      start = closeCompletion == null;
+      if (start) {
+        closeCompletion = new CompletableFuture<>();
+        closed.set(true);
+      }
+      completion = closeCompletion;
     }
+    if (start) finishClose(completion);
+    // A module may synchronously call its owner's close while it is being closed.
+    if (closingThread == Thread.currentThread()) return;
+    try {
+      completion.join();
+    } catch (java.util.concurrent.CompletionException error) {
+      if (error.getCause() instanceof RuntimeException runtime) throw runtime;
+      if (error.getCause() instanceof Error fatal) throw fatal;
+      throw error;
+    }
+  }
+
+  public CompletableFuture<Void> closeAsync() {
+    synchronized (closeLock) {
+      if (closeCompletion == null) {
+        closeCompletion = new CompletableFuture<>();
+        closed.set(true);
+        CompletableFuture<Void> completion = closeCompletion;
+        CompletableFuture.runAsync(() -> finishClose(completion));
+      }
+      return closeCompletion;
+    }
+  }
+
+  private void finishClose(CompletableFuture<Void> completion) {
+    closingThread = Thread.currentThread();
+    try {
+      closeResources();
+      completion.complete(null);
+    } catch (Throwable error) {
+      completion.completeExceptionally(error);
+    } finally {
+      closingThread = null;
+    }
+  }
+
+  private void closeResources() {
     List.copyOf(parentUnsubscribers).forEach(MessagevisorUnsubscribe::unsubscribe);
     parentUnsubscribers.clear();
     listeners.values().forEach(List::clear);
-    moduleDiagnosticSubscriptions.clear();
-    moduleApis.clear();
-    if (parent != null) return;
+    synchronized (parent == null ? moduleLock : parent.moduleLock) {
+      moduleDiagnosticSubscriptions.clear();
+      moduleApiActivity.values().forEach(active -> active.set(false));
+      moduleApiActivity.clear();
+      moduleApis.clear();
+      anonymousModuleApiKeys.clear();
+      moduleFlagResolvers.clear();
+      moduleVariationResolvers.clear();
+    }
+    if (parent != null) {
+      parent.children.remove(this);
+      return;
+    }
     List<Exception> errors = new ArrayList<>();
     synchronized (moduleLock) {
       for (int index = modules.size() - 1; index >= 0; index--) {
+        clearModuleDiagnosticSubscriptions(modules.get(index));
         try {
           modules.get(index).close();
         } catch (Exception error) {
@@ -779,14 +857,11 @@ public final class Messagevisor implements AutoCloseable {
         }
       }
       modules.clear();
+      children.clear();
     }
     if (!errors.isEmpty()) {
       throw new MessagevisorCloseException("One or more Messagevisor modules failed to close.", errors);
     }
-  }
-
-  public CompletableFuture<Void> closeAsync() {
-    return CompletableFuture.runAsync(this::close);
   }
 
   private String getCurrentLocale() {
@@ -921,6 +996,8 @@ public final class Messagevisor implements AutoCloseable {
                 .detail("locale", payload.locale())
                 .detail("messageKey", payload.messageKey())
                 .detail("source", payload.source())
+                .detail("hook", "format")
+                .moduleName(module.name())
                 .originalError(error)
                 .build());
         throw error;
@@ -932,13 +1009,26 @@ public final class Messagevisor implements AutoCloseable {
   private Object runTransforms(Object translation, MessagevisorTransformPayload payload) {
     Object current = translation;
     for (MessagevisorModule module : getModules()) {
-      Object next =
-          module.transform(
-              new MessagevisorTransformPayload(
-                  current, payload.locale(), payload.source(), payload.messageKey(), payload.meta()),
-              getModuleApi(module));
-      if (next != null) {
-        current = next;
+      try {
+        Object next =
+            module.transform(
+                new MessagevisorTransformPayload(
+                    current, payload.locale(), payload.source(), payload.messageKey(), payload.meta()),
+                getModuleApi(module));
+        if (next != null) {
+          current = next;
+        }
+      } catch (RuntimeException error) {
+        reportDiagnostic(
+            MessagevisorDiagnostic.builder(LogLevel.ERROR, "invalid_message", "Unable to transform message")
+                .detail("locale", payload.locale())
+                .detail("messageKey", payload.messageKey())
+                .detail("source", payload.source())
+                .detail("hook", "transform")
+                .moduleName(module.name())
+                .originalError(error)
+                .build());
+        throw error;
       }
     }
     return current;
@@ -968,9 +1058,9 @@ public final class Messagevisor implements AutoCloseable {
                     firstNonBlank(options.currency(), ObjectMaps.stringOption(format, "currency"), currency, "USD"));
               }
             });
-    formats.getDate().values().forEach(format -> format.put("timeZone", firstNonBlank(options.timeZone(), ObjectMaps.stringOption(format, "timeZone"), timeZone, null)));
-    formats.getTime().values().forEach(format -> format.put("timeZone", firstNonBlank(options.timeZone(), ObjectMaps.stringOption(format, "timeZone"), timeZone, null)));
-    formats.getDateTimeRange().values().forEach(format -> format.put("timeZone", firstNonBlank(options.timeZone(), ObjectMaps.stringOption(format, "timeZone"), timeZone, null)));
+    formats.getDate().values().forEach(format -> format.put("timeZone", firstDefined(options.timeZone(), ObjectMaps.stringOption(format, "timeZone"), timeZone, defaultTimeZone)));
+    formats.getTime().values().forEach(format -> format.put("timeZone", firstDefined(options.timeZone(), ObjectMaps.stringOption(format, "timeZone"), timeZone, defaultTimeZone)));
+    formats.getDateTimeRange().values().forEach(format -> format.put("timeZone", firstDefined(options.timeZone(), ObjectMaps.stringOption(format, "timeZone"), timeZone, defaultTimeZone)));
   }
 
   private void reportFormatterDiagnostics(
@@ -1043,22 +1133,37 @@ public final class Messagevisor implements AutoCloseable {
   }
 
   private MessagevisorModuleApi getModuleApi(MessagevisorModule module) {
-    String key = getModuleApiKey(module);
-    return moduleApis.computeIfAbsent(key, ignored -> createModuleApi(module, key));
+    synchronized (parent == null ? moduleLock : parent.moduleLock) {
+      if (parent != null && !parent.modules.contains(module)) {
+        return createModuleApi(module, "removed", new AtomicBoolean(false));
+      }
+      String key = getModuleApiKey(module);
+      return moduleApis.computeIfAbsent(key, ignored -> {
+        AtomicBoolean active = new AtomicBoolean(true);
+        moduleApiActivity.put(key, active);
+        return createModuleApi(module, key, active);
+      });
+    }
   }
 
-  private MessagevisorModuleApi createModuleApi(MessagevisorModule module, String moduleKey) {
+  private MessagevisorModuleApi createModuleApi(MessagevisorModule module, String moduleKey, AtomicBoolean active) {
     return new MessagevisorModuleApi() {
       @Override
       public void setFlagResolver(FlagResolver resolver) {
-        moduleFlagResolvers.removeIf(registration -> Objects.equals(registration.moduleKey(), moduleKey));
-        if (resolver != null) moduleFlagResolvers.add(new ModuleFlagResolver(moduleKey, resolver));
+        synchronized (parent == null ? moduleLock : parent.moduleLock) {
+          if (!active.get() || closed.get()) return;
+          moduleFlagResolvers.removeIf(registration -> Objects.equals(registration.moduleKey(), moduleKey));
+          if (resolver != null) moduleFlagResolvers.add(new ModuleFlagResolver(moduleKey, resolver));
+        }
       }
 
       @Override
       public void setVariationResolver(VariationResolver resolver) {
-        moduleVariationResolvers.removeIf(registration -> Objects.equals(registration.moduleKey(), moduleKey));
-        if (resolver != null) moduleVariationResolvers.add(new ModuleVariationResolver(moduleKey, resolver));
+        synchronized (parent == null ? moduleLock : parent.moduleLock) {
+          if (!active.get() || closed.get()) return;
+          moduleVariationResolvers.removeIf(registration -> Objects.equals(registration.moduleKey(), moduleKey));
+          if (resolver != null) moduleVariationResolvers.add(new ModuleVariationResolver(moduleKey, resolver));
+        }
       }
 
       @Override
@@ -1069,16 +1174,20 @@ public final class Messagevisor implements AutoCloseable {
       @Override
       public MessagevisorUnsubscribe onDiagnostic(
           MessagevisorDiagnosticHandler handler, MessagevisorModuleDiagnosticOptions options) {
-        MessagevisorModuleDiagnosticOptions resolvedOptions =
-            options == null ? new MessagevisorModuleDiagnosticOptions(LogLevel.INFO) : options;
-        ModuleDiagnosticSubscription subscription =
-            new ModuleDiagnosticSubscription(moduleKey, handler, resolvedOptions.logLevel());
-        moduleDiagnosticSubscriptions.add(subscription);
-        return () -> moduleDiagnosticSubscriptions.remove(subscription);
+        synchronized (parent == null ? moduleLock : parent.moduleLock) {
+          if (!active.get() || closed.get()) return () -> {};
+          MessagevisorModuleDiagnosticOptions resolvedOptions =
+              options == null ? new MessagevisorModuleDiagnosticOptions(LogLevel.INFO) : options;
+          ModuleDiagnosticSubscription subscription =
+              new ModuleDiagnosticSubscription(moduleKey, handler, resolvedOptions.logLevel());
+          moduleDiagnosticSubscriptions.add(subscription);
+          return () -> moduleDiagnosticSubscriptions.remove(subscription);
+        }
       }
 
       @Override
       public void reportDiagnostic(MessagevisorModuleReportedDiagnostic diagnostic) {
+        if (!active.get() || closed.get()) return;
         MessagevisorDiagnostic.Builder builder =
             MessagevisorDiagnostic.builder(diagnostic.level(), diagnostic.code(), diagnostic.message())
                 .details(diagnostic.details())
@@ -1100,7 +1209,11 @@ public final class Messagevisor implements AutoCloseable {
   }
 
   private void clearModuleDiagnosticSubscriptions(MessagevisorModule module) {
-    String key = getModuleApiKey(module);
+    children.forEach(child -> child.clearModuleDiagnosticSubscriptions(module));
+    String key = module.name() == null ? anonymousModuleApiKeys.get(module) : "name:" + module.name();
+    if (key == null) return;
+    AtomicBoolean active = moduleApiActivity.remove(key);
+    if (active != null) active.set(false);
     moduleDiagnosticSubscriptions.removeIf(subscription -> Objects.equals(subscription.moduleKey, key));
     moduleFlagResolvers.removeIf(registration -> Objects.equals(registration.moduleKey(), key));
     moduleVariationResolvers.removeIf(registration -> Objects.equals(registration.moduleKey(), key));
@@ -1206,6 +1319,22 @@ public final class Messagevisor implements AutoCloseable {
 
   private static DatafileContent mergeStoredDatafile(
       DatafileContent existing, DatafileContent incoming) {
+    FormatPresets formats = existing.getFormats().copy();
+    FormatPresets update = incoming.getFormats().copy();
+    formats.getNumber().putAll(update.getNumber());
+    formats.getDate().putAll(update.getDate());
+    formats.getTime().putAll(update.getTime());
+    formats.getRelative().putAll(update.getRelative());
+    formats.getDateTimeRange().putAll(update.getDateTimeRange());
+    update.additional().forEach((family, presets) -> {
+      Object previous = formats.additional().get(family);
+      if (previous instanceof Map<?, ?> oldMap && presets instanceof Map<?, ?> newMap) {
+        formats.additional().put(family, shallowMerge(ObjectMaps.stringMap(oldMap), ObjectMaps.stringMap(newMap)));
+      } else {
+        formats.additional().put(family, presets);
+      }
+    });
+    incoming.setFormats(formats);
     incoming.setDirection(incoming.getDirection() == null ? existing.getDirection() : incoming.getDirection());
     incoming.setSegments(shallowMergeTyped(existing.getSegments(), incoming.getSegments()));
     incoming.setMessages(shallowMergeTyped(existing.getMessages(), incoming.getMessages()));
@@ -1242,9 +1371,7 @@ public final class Messagevisor implements AutoCloseable {
 
   private Map<String, Object> withTimeZoneOption(Map<String, Object> format, EvaluationOptions options) {
     Map<String, Object> result = CloneUtils.deepCopyMap(format);
-    if (options.timeZone() != null) {
-      result.put("timeZone", options.timeZone());
-    }
+    result.put("timeZone", firstDefined(options.timeZone(), ObjectMaps.stringOption(result, "timeZone"), timeZone, defaultTimeZone));
     return result;
   }
 
@@ -1257,6 +1384,13 @@ public final class Messagevisor implements AutoCloseable {
     Map<String, Object> result = CloneUtils.deepCopyMap(options);
     result.remove("locale");
     return result;
+  }
+
+  private static String firstDefined(String... values) {
+    for (String value : values) {
+      if (value != null) return value;
+    }
+    return null;
   }
 
   private static String firstNonBlank(String... values) {

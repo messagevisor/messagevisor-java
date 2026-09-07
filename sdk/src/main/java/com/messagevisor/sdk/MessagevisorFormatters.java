@@ -69,7 +69,7 @@ public final class MessagevisorFormatters {
       Object value, String locale, Map<String, Object> options, String runtimeTimeZone) {
     Date date = toDate(value);
     if (date == null) {
-      return String.valueOf(value);
+      throw new IllegalArgumentException("Invalid date value: " + value);
     }
     return dateFormatter(locale, options, runtimeTimeZone, false).format(date);
   }
@@ -83,7 +83,7 @@ public final class MessagevisorFormatters {
       Object value, String locale, Map<String, Object> options, String runtimeTimeZone) {
     Date date = toDate(value);
     if (date == null) {
-      return String.valueOf(value);
+      throw new IllegalArgumentException("Invalid time value: " + value);
     }
     return dateFormatter(locale, options, runtimeTimeZone, true).format(date);
   }
@@ -102,7 +102,7 @@ public final class MessagevisorFormatters {
     Date startDate = toDate(start);
     Date endDate = toDate(end);
     if (startDate == null || endDate == null) {
-      return String.valueOf(start) + " - " + end;
+      throw new IllegalArgumentException("Invalid date range");
     }
     Map<String, Object> resolved = safeOptions(options);
     DateIntervalFormat formatter =
@@ -113,6 +113,7 @@ public final class MessagevisorFormatters {
 
   public static String formatRelativeTime(
       double value, String unit, String locale, Map<String, Object> options) {
+    if (!Double.isFinite(value)) throw new IllegalArgumentException("Invalid relative time value: " + value);
     Map<String, Object> resolved = safeOptions(options);
     RelativeDateTimeFormatter.Style style =
         switch (String.valueOf(resolved.getOrDefault("style", "long"))) {
@@ -147,14 +148,30 @@ public final class MessagevisorFormatters {
   }
 
   public static String formatPlural(double value, String locale, boolean ordinal) {
+    return formatPlural(value, locale, Map.of("type", ordinal ? "ordinal" : "cardinal"));
+  }
+
+  public static String formatPlural(double value, String locale, Map<String, Object> options) {
+    Map<String, Object> resolved = CloneUtils.deepCopyMap(options);
+    resolved.putIfAbsent("roundingPriority", "auto");
+    String type = String.valueOf(resolved.getOrDefault("type", "cardinal"));
+    if (!"ordinal".equals(type) && !"cardinal".equals(type)) {
+      throw new IllegalArgumentException("Unknown plural rule type: " + type);
+    }
     PluralRules rules =
         PluralRules.forLocale(
             ULocale.forLanguageTag(locale),
-            ordinal ? PluralRules.PluralType.ORDINAL : PluralRules.PluralType.CARDINAL);
-    return rules.select(value);
+            "ordinal".equals(type) ? PluralRules.PluralType.ORDINAL : PluralRules.PluralType.CARDINAL);
+    // Plural operands include visible fractional digits after the requested rounding.
+    // ICU's formatted number carries those operands without parsing localized text.
+    BigDecimal number = Double.isFinite(value) ? BigDecimal.valueOf(value) : BigDecimal.ZERO;
+    LocalizedNumberFormatter formatter = NumberFormatter.withLocale(ULocale.forLanguageTag(locale))
+        .precision(precision(resolved, null)).roundingMode(roundingMode(resolved, number));
+    return Double.isFinite(value) ? rules.select(formatter.format(number)) : "other";
   }
 
   public static String formatList(List<String> values, String locale, Map<String, Object> options) {
+    validateList(values);
     if (values == null || values.isEmpty()) {
       return "";
     }
@@ -165,13 +182,29 @@ public final class MessagevisorFormatters {
 
   public static List<FormatPart> formatListToParts(
       List<String> values, String locale, Map<String, Object> options) {
+    validateList(values);
+    if (values == null || values.isEmpty()) return List.of();
+    ListFormatter.FormattedList formatted = ListFormatter.getInstance(
+        ULocale.forLanguageTag(locale), listType(options), listWidth(options)).formatToValue(values);
     List<FormatPart> parts = new ArrayList<>();
-    if (values != null) {
-      for (String value : values) {
-        parts.add(new FormatPart("element", value));
+    ConstrainedFieldPosition position = new ConstrainedFieldPosition();
+    position.constrainField(ListFormatter.Field.ELEMENT);
+    int cursor = 0;
+    while (formatted.nextPosition(position)) {
+      if (position.getStart() > cursor) {
+        parts.add(new FormatPart("literal", formatted.subSequence(cursor, position.getStart()).toString()));
       }
+      parts.add(new FormatPart("element", formatted.subSequence(position.getStart(), position.getLimit()).toString()));
+      cursor = position.getLimit();
     }
-    return parts.isEmpty() ? singlePart("literal", "") : parts;
+    if (cursor < formatted.length()) parts.add(new FormatPart("literal", formatted.subSequence(cursor, formatted.length()).toString()));
+    return parts;
+  }
+
+  private static void validateList(List<?> values) {
+    if (values != null) for (Object value : values) {
+      if (!(value instanceof String)) throw new IllegalArgumentException("List elements must be strings");
+    }
   }
 
   public static String formatDisplayName(String value, String locale, Map<String, Object> options) {
@@ -179,6 +212,9 @@ public final class MessagevisorFormatters {
     ULocale resolvedLocale = ULocale.forLanguageTag(locale);
     LocaleDisplayNames names = LocaleDisplayNames.getInstance(resolvedLocale);
     String type = ObjectMaps.stringOption(resolvedOptions, "type");
+    if ("region".equals(type) && (value == null || !value.matches("[A-Za-z]{2}|[0-9]{3}"))) {
+      throw new IllegalArgumentException("Invalid region code: " + value);
+    }
     String resolved =
         switch (type == null ? "" : type) {
           case "language" -> names.languageDisplayName(value);
@@ -199,9 +235,6 @@ public final class MessagevisorFormatters {
     if ((family.equals("date") || family.equals("time") || family.equals("dateTimeRange"))
         && resolved.containsKey("formatMatcher")) {
       messages.add("Java uses ICU locale pattern matching for formatMatcher.");
-    }
-    if (family.equals("list")) {
-      messages.add("Java formatListToParts returns simplified element parts.");
     }
     if (family.equals("displayName")
         && (resolved.containsKey("languageDisplay") || resolved.containsKey("style"))) {
@@ -401,7 +434,8 @@ public final class MessagevisorFormatters {
     } else {
       String skeleton = time ? timeSkeleton(resolved) : dateSkeleton(resolved);
       if (skeleton.isEmpty()) {
-        formatter = DateFormat.getDateInstance(DateFormat.DEFAULT, resolvedLocale);
+        formatter = time ? DateFormat.getTimeInstance(DateFormat.DEFAULT, resolvedLocale)
+            : DateFormat.getDateInstance(DateFormat.DEFAULT, resolvedLocale);
       } else {
         String pattern =
             DateTimePatternGenerator.getInstance(resolvedLocale)
@@ -525,7 +559,6 @@ public final class MessagevisorFormatters {
       return pattern;
     }
     String symbol = hourSymbol(options);
-    int width = "2-digit".equals(ObjectMaps.stringOption(options, "hour")) ? 2 : 1;
     StringBuilder result = new StringBuilder();
     boolean quoted = false;
     for (int index = 0; index < pattern.length(); ) {
@@ -535,9 +568,11 @@ public final class MessagevisorFormatters {
         result.append(current);
         index++;
       } else if (!quoted && "hHKkj".indexOf(current) >= 0) {
+        int start = index;
         while (index < pattern.length() && pattern.charAt(index) == current) {
           index++;
         }
+        int width = "2-digit".equals(ObjectMaps.stringOption(options, "hour")) ? 2 : index - start;
         result.append(symbol.repeat(width));
       } else {
         result.append(current);
@@ -566,12 +601,12 @@ public final class MessagevisorFormatters {
 
   private static String resolveTimeZone(Map<String, Object> options, String runtimeTimeZone) {
     String formatTimeZone = ObjectMaps.stringOption(options, "timeZone");
-    if (formatTimeZone != null && !formatTimeZone.isBlank()) {
-      return formatTimeZone;
+    String zone = formatTimeZone != null ? formatTimeZone
+        : runtimeTimeZone == null ? TimeZone.getDefault().getID() : runtimeTimeZone;
+    if (TimeZone.UNKNOWN_ZONE_ID.equals(TimeZone.getTimeZone(zone).getID())) {
+      throw new IllegalArgumentException("Unknown time zone: " + zone);
     }
-    return runtimeTimeZone == null || runtimeTimeZone.isBlank()
-        ? TimeZone.getDefault().getID()
-        : runtimeTimeZone;
+    return zone;
   }
 
   private static ULocale numberLocale(String locale, Map<String, Object> options) {
@@ -610,7 +645,9 @@ public final class MessagevisorFormatters {
 
   private static Date toDate(Object value) {
     if (value instanceof Date date) return date;
-    if (value instanceof Number number) return new Date(number.longValue());
+    if (value instanceof Number number) {
+      return Double.isFinite(number.doubleValue()) ? new Date(number.longValue()) : null;
+    }
     if (value instanceof Instant instant) return Date.from(instant);
     try {
       return Date.from(Instant.parse(String.valueOf(value)));
@@ -659,7 +696,9 @@ public final class MessagevisorFormatters {
       case "week" -> RelativeDateTimeFormatter.RelativeUnit.WEEKS;
       case "month" -> RelativeDateTimeFormatter.RelativeUnit.MONTHS;
       case "year" -> RelativeDateTimeFormatter.RelativeUnit.YEARS;
-      default -> RelativeDateTimeFormatter.RelativeUnit.DAYS;
+      case "quarter" -> RelativeDateTimeFormatter.RelativeUnit.QUARTERS;
+      case "day" -> RelativeDateTimeFormatter.RelativeUnit.DAYS;
+      default -> throw new IllegalArgumentException("Invalid relative time unit: " + unit);
     };
   }
 

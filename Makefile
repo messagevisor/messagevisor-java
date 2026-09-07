@@ -17,7 +17,7 @@ verify-artifacts:
 	bash scripts/verify-artifacts.sh
 
 test-project-1:
-	$(GRADLE) :cli:run --args='test --projectDirectoryPath=$(PROJECT_1) --onlyFailures --target=java --normalizeSpaces --withIcuModule --withInterpolationModule'
+	$(GRADLE) :cli:run --args='test --projectDirectoryPath=$(PROJECT_1) --onlyFailures --target=java --normalizeSpaces --withIcuModule'
 
 evaluate-project-1:
 	$(GRADLE) :cli:run --args='evaluate --projectDirectoryPath=$(PROJECT_1) --locale=en-US --rawMessage=Hello --withIcuModule --json'
@@ -26,4 +26,4 @@ benchmark-project-1:
 	$(GRADLE) :cli:run --args='benchmark --projectDirectoryPath=$(PROJECT_1) --locale=en-US --rawMessage=Hello --withIcuModule -n=1000 --json'
 
 examples-project-1:
-	$(GRADLE) --quiet :cli:run --args='examples --projectDirectoryPath=$(PROJECT_1) --withIcuModule'
+	$(GRADLE) --quiet :cli:run --args='examples --projectDirectoryPath=$(PROJECT_1) --withIcuModule --normalizeSpaces --onlyFailures'

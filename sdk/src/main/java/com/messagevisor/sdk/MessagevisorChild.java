@@ -78,6 +78,8 @@ public final class MessagevisorChild implements AutoCloseable {
   public String formatPlural(double value, boolean ordinal) { return delegate.formatPlural(value, ordinal); }
   public String formatPlural(double value, EvaluationOptions options) { return delegate.formatPlural(value, options); }
   public String formatPlural(double value, boolean ordinal, EvaluationOptions options) { return delegate.formatPlural(value, ordinal, options); }
+  public String formatPlural(double value, Map<String, Object> options) { return delegate.formatPlural(value, options); }
+  public String formatPlural(double value, Map<String, Object> format, EvaluationOptions options) { return delegate.formatPlural(value, format, options); }
   public String formatList(List<String> values) { return delegate.formatList(values); }
   public String formatList(List<String> values, Map<String, Object> options) { return delegate.formatList(values, options); }
   public List<FormatPart> formatListToParts(List<String> values) { return delegate.formatListToParts(values); }
